@@ -23,6 +23,7 @@ export default function SalesChatbot() {
   const [loading, setLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const STORAGE_KEY = "salesChatHistory";
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -31,6 +32,46 @@ export default function SalesChatbot() {
   useEffect(() => {
     scrollToBottom();
   }, [messages, loading]);
+
+  // Load chat history from localStorage on mount
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as Array<any>;
+      const restored = parsed.map((m) => ({ ...m, timestamp: m.timestamp ? new Date(m.timestamp) : new Date() }));
+      setMessages(restored);
+      // eslint-disable-next-line no-console
+      console.log(`Loaded ${restored.length} messages from localStorage`);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("Failed to load chat history from localStorage:", e);
+    }
+  }, []);
+
+  // Persist chat history to localStorage when messages change (keep last 200 entries)
+  useEffect(() => {
+    try {
+      const toSave = messages.slice(-200).map((m) => ({ ...m, timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(toSave));
+      // eslint-disable-next-line no-console
+      console.debug(`Saved ${toSave.length} messages to localStorage`);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("Failed to save chat history to localStorage:", e);
+    }
+  }, [messages]);
+
+  const clearHistory = () => {
+    if (!confirm("Clear chat history? This cannot be undone.")) return;
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("Failed to remove chat history from localStorage:", e);
+    }
+    setMessages([]);
+  };
 
   async function send() {
     if (!prompt.trim()) return;
@@ -94,13 +135,22 @@ export default function SalesChatbot() {
     <div className="flex flex-col h-screen max-h-[900px] w-full x-auto bg-gradient-to-br from-slate-50 to-slate-100">
       {/* Header */}
       <div className="bg-white border-b border-slate-200 px-6 py-4 shadow-sm">
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 w-full">
           <div className="w-10 h-10 bg-gradient-to-br from-sky-500 to-blue-600 rounded-lg flex items-center justify-center shadow-md">
             <BarChart3 className="w-5 h-5 text-white" />
           </div>
           <div>
             <h2 className="text-xl font-semibold text-slate-800">Sales Analytics Assistant</h2>
             <p className="text-sm text-slate-500">Ask me about your sales data</p>
+          </div>
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              onClick={clearHistory}
+              className="text-xs text-slate-500 hover:text-slate-700 border border-slate-200 rounded px-2 py-1 bg-white"
+              title="Clear chat history"
+            >
+              Clear history
+            </button>
           </div>
         </div>
       </div>
@@ -263,7 +313,7 @@ export default function SalesChatbot() {
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
               onKeyPress={handleKeyPress}
-              className="w-full rounded-xl border border-slate-300 px-4 py-3 pr-12 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent transition-all text-sm placeholder:text-slate-400 bg-slate-50 focus:bg-white"
+              className="w-full rounded-xl border text-black border-slate-300 px-4 py-3 pr-12 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent transition-all text-sm placeholder:text-slate-400 bg-slate-50 focus:bg-white"
               placeholder="Ask about sales data, request charts, or get insights..."
               disabled={loading}
             />
