@@ -6,10 +6,8 @@ export const metadata = {
 
 export default function Page() {
   return (
-    <main className="min-h-screen flex flex-col items-center p-6">
-      <div className="w-full max-w-5xl">
+  
         <SalesChatbot />
-      </div>
-    </main>
+    
   );
 }
