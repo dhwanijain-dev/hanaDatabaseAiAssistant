@@ -1,21 +1,25 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
-import { Bar } from "react-chartjs-2";
-import {
-  Chart as ChartJS,
-  CategoryScale,
-  LinearScale,
-  BarElement,
-  PointElement,
-  LineElement,
-  Title,
-  Tooltip,
-  Legend,
-} from "chart.js";
+import React, { useState, useEffect, useRef, useMemo } from "react";
+import dynamic from "next/dynamic";
 import { Send, BarChart3, Table2, Loader2 } from "lucide-react";
+import { FixedSizeList as List } from "react-window";
 
-ChartJS.register(CategoryScale, LinearScale, BarElement, PointElement, LineElement, Title, Tooltip, Legend);
+// Lazy load chart implementation only when needed
+import type { SalesChartProps } from "./SalesChartLazy";
+const LazyBarChart = dynamic<SalesChartProps>(
+  () => import("./SalesChartLazy").then((m) => m.default),
+  { ssr: false }
+);
+
+// Simple debounce hook for future auto-suggest / throttled send
+function useDebouncedCallback(cb: (...args: any[]) => void, delay: number) {
+  const t = useRef<NodeJS.Timeout | null>(null);
+  return (...args: any[]) => {
+    if (t.current) clearTimeout(t.current);
+    t.current = setTimeout(() => cb(...args), delay);
+  };
+}
 
 export default function SalesChatbot() {
   const [prompt, setPrompt] = useState("");
@@ -73,41 +77,41 @@ export default function SalesChatbot() {
     setMessages([]);
   };
 
-  async function send() {
-    if (!prompt.trim()) return;
-    const text = prompt.trim();
+  const COOLDOWN_MS = 400;
+  const lastSendRef = useRef<number>(0);
+
+  async function sendImmediate(text: string) {
     setMessages((m) => [...m, { role: "user", text, timestamp: new Date() }]);
     setPrompt("");
     setLoading(true);
-    
     try {
       console.log("Sending prompt to /api/sales-chat", text);
-      const res = await fetch("/api/sales-chat", { 
-        method: "POST", 
-        headers: { "Content-Type": "application/json" }, 
-        body: JSON.stringify({ prompt: text }) 
+      const res = await fetch("/api/sales-chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: text })
       });
-      
       console.log("/api/sales-chat response status:", res.status);
       const data = await res.json();
       console.debug("/api/sales-chat response json:", data);
-      
       if (data.error) {
         setMessages((m) => [...m, { role: "bot", text: `Error: ${data.error}`, timestamp: new Date() }]);
       } else if (data.type === "table") {
         setMessages((m) => [...m, { role: "bot", rows: data.rows, timestamp: new Date() }]);
       } else if (data.type === "chart") {
-        setMessages((m) => [...m, { 
-          role: "bot", 
+        setMessages((m) => [...m, {
+          role: "bot",
           chart: { labels: data.labels, values: data.values, chartType: data.chartType },
           timestamp: new Date()
         }]);
       } else if (data.type === "help") {
-        setMessages((m) => [...m, { 
-          role: "bot", 
-          text: data.message + "\n\nExamples:\n" + (data.examples || []).map((ex: string) => `• ${ex}`).join("\n"),
+        setMessages((m) => [...m, {
+          role: "bot",
+            text: data.message + "\n\nExamples:\n" + (data.examples || []).map((ex: string) => `• ${ex}`).join("\n"),
           timestamp: new Date()
         }]);
+      } else if (data.type === "summary") {
+        setMessages((m) => [...m, { role: "bot", text: JSON.stringify(data.summary, null, 2), timestamp: new Date() }]);
       } else {
         setMessages((m) => [...m, { role: "bot", text: JSON.stringify(data), timestamp: new Date() }]);
       }
@@ -120,10 +124,20 @@ export default function SalesChatbot() {
     }
   }
 
+  const send = () => {
+    const text = prompt.trim();
+    if (!text) return;
+    const now = Date.now();
+    if (now - lastSendRef.current < COOLDOWN_MS) return; // cooldown enforcement
+    lastSendRef.current = now;
+    void sendImmediate(text);
+  };
+  const debouncedSend = useDebouncedCallback(send, 120);
+
   const handleKeyPress = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      send();
+      debouncedSend();
     }
   };
 
@@ -180,7 +194,7 @@ export default function SalesChatbot() {
             key={idx}
             className={`flex ${m.role === "user" ? "justify-end" : "justify-start"} animate-fade-in`}
           >
-            <div className={`flex flex-col max-w-[85%] ${m.role === "user" ? "items-end" : "items-start"}`}>
+            <div className={`flex flex-col ${m.rows || m.chart ? "w-full" : "max-w-[85%]"} ${m.role === "user" ? "items-end" : "items-start"}`}>
               {m.text && (
                 <div
                   className={`px-4 py-3 rounded-2xl shadow-sm transition-all hover:shadow-md ${
@@ -194,94 +208,16 @@ export default function SalesChatbot() {
               )}
 
               {m.rows && Array.isArray(m.rows) && m.rows.length > 0 && (
-                <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden mt-2 w-full">
-                  <div className="bg-gradient-to-r from-slate-50 to-slate-100 px-4 py-2 border-b border-slate-200 flex items-center gap-2">
-                    <Table2 className="w-4 h-4 text-slate-600" />
-                    <span className="text-sm font-medium text-slate-700">Data Results</span>
-                    <span className="text-xs text-slate-500 ml-auto">{m.rows.length} rows</span>
-                  </div>
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-sm">
-                      <thead className="bg-slate-50">
-                        <tr>
-                          {(() => {
-                            const firstRow = m.rows && m.rows[0] ? m.rows[0] : {};
-                            return Object.keys(firstRow).slice(0, 8).map((h) => (
-                              <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-slate-600 uppercase tracking-wider border-b border-slate-200">
-                                {h}
-                              </th>
-                            ));
-                          })()}
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-100">
-                        {m.rows.slice(0, 20).map((r, i) => (
-                          <tr key={i} className="hover:bg-slate-50 transition-colors">
-                            {(() => {
-                              const firstRow = m.rows && m.rows[0] ? m.rows[0] : {};
-                              return Object.keys(firstRow).slice(0, 8).map((h) => (
-                                <td key={h} className="px-4 py-3 text-slate-700">
-                                  {String(r[h] ?? "")}
-                                </td>
-                              ));
-                            })()}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                  {m.rows.length > 20 && (
-                    <div className="px-4 py-2 text-xs text-slate-500 bg-slate-50 border-t border-slate-200">
-                      Showing first 20 of {m.rows.length} rows
-                    </div>
-                  )}
-                </div>
+                <OptimizedTable rows={m.rows} />
               )}
-
+            
               {m.chart && (
                 <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 mt-2 w-full">
                   <div className="flex items-center gap-2 mb-4">
                     <BarChart3 className="w-4 h-4 text-sky-600" />
                     <span className="text-sm font-medium text-slate-700">Sales Chart</span>
                   </div>
-                  <Bar
-                    data={{
-                      labels: m.chart.labels,
-                      datasets: [{
-                        label: "Sales Amount",
-                        data: m.chart.values,
-                        backgroundColor: "rgba(14, 165, 233, 0.8)",
-                        borderColor: "rgba(14, 165, 233, 1)",
-                        borderWidth: 2,
-                        borderRadius: 6,
-                      }]
-                    }}
-                    options={{
-                      responsive: true,
-                      maintainAspectRatio: true,
-                      plugins: {
-                        legend: { display: false },
-                        tooltip: {
-                          backgroundColor: "rgba(15, 23, 42, 0.9)",
-                          padding: 12,
-                          cornerRadius: 8,
-                          titleFont: { size: 14, weight: 600 },
-                          bodyFont: { size: 13 }
-                        }
-                      },
-                      scales: {
-                        y: {
-                          beginAtZero: true,
-                          grid: { color: "rgba(148, 163, 184, 0.1)" },
-                          ticks: { color: "#64748b", font: { size: 11 } }
-                        },
-                        x: {
-                          grid: { display: false },
-                          ticks: { color: "#64748b", font: { size: 11 } }
-                        }
-                      }
-                    }}
-                  />
+                  <LazyBarChart labels={m.chart.labels} values={m.chart.values} />
                 </div>
               )}
 
@@ -350,6 +286,108 @@ export default function SalesChatbot() {
           animation: fade-in 0.3s ease-out;
         }
       `}</style>
+    </div>
+  );
+}
+
+// Optimized table component with memoized headers and virtualization
+function OptimizedTable({ rows }: { rows: any[] }) {
+  const firstRow = rows[0] || {};
+  const headers = useMemo(() => Object.keys(firstRow).slice(0, 8), [firstRow]);
+  const useVirtualized = rows.length > 50;
+
+  if (!useVirtualized) {
+    return (
+      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden mt-2 w-full">
+        <div className="bg-gradient-to-r from-slate-50 to-slate-100 px-4 py-2 border-b border-slate-200 flex items-center gap-2">
+          <Table2 className="w-4 h-4 text-slate-600" />
+          <span className="text-sm font-medium text-slate-700">Data Results</span>
+          <span className="text-xs text-slate-500 ml-auto">{rows.length} rows</span>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50">
+              <tr>
+                {headers.map((h) => (
+                  <th key={h} className="px-4 py-3 text-left text-xs font-semibold text-black uppercase tracking-wider border-b border-slate-200">
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {rows.slice(0, 200).map((r, i) => (
+                <tr key={i} className="hover:bg-slate-50 transition-colors">
+                  {headers.map((h) => (
+                    <td key={h} className="px-4 py-3 text-black">
+                      {String(r[h] ?? "")}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {rows.length > 200 && (
+          <div className="px-4 py-2 text-xs text-slate-500 bg-slate-50 border-t border-slate-200">Showing first 200 of {rows.length} rows</div>
+        )}
+      </div>
+    );
+  }
+
+  const itemCount = Math.min(rows.length, 1000);
+  const containerRef = React.useRef<HTMLDivElement>(null);
+  const [listWidth, setListWidth] = React.useState<number>(800);
+
+  React.useEffect(() => {
+    function handleResize() {
+      if (containerRef.current) {
+        const w = containerRef.current.clientWidth;
+        // Avoid too small width that breaks layout
+        setListWidth(Math.max(w, 300));
+      }
+    }
+    handleResize();
+    const ro = new ResizeObserver(handleResize);
+    if (containerRef.current) ro.observe(containerRef.current);
+    return () => ro.disconnect();
+  }, []);
+
+  const Row = ({ index, style }: { index: number; style: React.CSSProperties }) => {
+    const r = rows[index];
+    return (
+      <div style={style} className="flex border-b border-slate-100 hover:bg-slate-50 text-sm">
+        {headers.map((h) => (
+          <div key={h} className="px-4 py-2 flex-1 truncate text-black">
+            {String(r[h] ?? "")}
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  return (
+    <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden mt-2 w-full" ref={containerRef}>
+      <div className="bg-gradient-to-r from-slate-50 to-slate-100 px-4 py-2 border-b border-slate-200 flex items-center gap-2">
+        <Table2 className="w-4 h-4 text-slate-600" />
+        <span className="text-sm font-medium text-black">Data Results (virtualized)</span>
+        <span className="text-xs text-slate-500 ml-auto">{rows.length} rows</span>
+      </div>
+      <div className="overflow-x-auto">
+        <div className="min-w-full">
+          <div className="bg-slate-50 border-b border-slate-200 flex text-xs font-semibold text-black uppercase tracking-wider">
+            {headers.map((h) => (
+              <div key={h} className="px-4 py-3 flex-1 text-black">{h}</div>
+            ))}
+          </div>
+          <List height={400} width={listWidth} itemCount={itemCount} itemSize={40} className="select-none">
+            {Row}
+          </List>
+        </div>
+      </div>
+      {rows.length > itemCount && (
+        <div className="px-4 py-2 text-xs text-slate-500 bg-slate-50 border-t border-slate-200">Showing first {itemCount} of {rows.length} rows</div>
+      )}
     </div>
   );
 }
