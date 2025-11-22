@@ -5,7 +5,10 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",
-    "test": "jest --passWithNoTests"
+    "test": "jest --passWithNoTests",
+    "ingest": "node scripts/ingest.js incremental",
+    "ingest:full": "node scripts/ingest.js full",
+    "ingest:status": "node scripts/ingest.js status"
   },
   "dependencies": {
     "@radix-ui/react-checkbox": "^1.3.1",

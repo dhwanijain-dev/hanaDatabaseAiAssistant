@@ -7,24 +7,22 @@ import { FixedSizeList as List } from "react-window";
 
 // Lazy load chart implementation only when needed
 import type { SalesChartProps } from "./SalesChartLazy";
-const LazyBarChart = dynamic<SalesChartProps>(
-  () => import("./SalesChartLazy").then((m) => m.default),
-  { ssr: false }
-);
+const LazyBarChart = dynamic<SalesChartProps>(() => import("./SalesChartLazy").then((m) => m.default), { ssr: false });
 
 // Simple debounce hook for future auto-suggest / throttled send
 function useDebouncedCallback(cb: (...args: any[]) => void, delay: number) {
   const t = useRef<NodeJS.Timeout | null>(null);
   return (...args: any[]) => {
-    if (t.current) clearTimeout(t.current);
-    t.current = setTimeout(() => cb(...args), delay);
+    if (t.current) clearTimeout(t.current as any);
+    t.current = setTimeout(() => cb(...args), delay) as unknown as NodeJS.Timeout;
   };
 }
 
 export default function SalesChatbot() {
   const [prompt, setPrompt] = useState("");
-  const [messages, setMessages] = useState<Array<{ role: "user" | "bot"; text?: string; rows?: any[]; chart?: any; timestamp: Date }>>([]);
+  const [messages, setMessages] = useState<Array<{ role: "user" | "bot"; text?: string; rows?: any[]; chart?: any; timestamp: Date; correlationId?: string; durationMs?: number }>>([]);
   const [loading, setLoading] = useState(false);
+  const [useRag, setUseRag] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const STORAGE_KEY = "salesChatHistory";
@@ -85,39 +83,49 @@ export default function SalesChatbot() {
     setPrompt("");
     setLoading(true);
     try {
+      if (useRag) {
+        // Prefer RAG endpoint first. If no useful RAG result, fall back to SQL endpoint.
+        console.log("Sending prompt to /api/rag/query (RAG-first)", text);
+        const ragRes = await fetch("/api/rag/query", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ prompt: text })
+        });
+        const ragData = await ragRes.json().catch(() => null);
+        console.debug("/api/rag/query response json:", ragData);
+
+        if (ragData && ragData.type === "rag_answer") {
+          setMessages((m) => [...m, { role: "bot", text: ragData.answer, correlationId: ragData.correlationId, durationMs: ragData.durationMs, timestamp: new Date() }]);
+          return;
+        }
+        // fall through to SQL fallback
+      }
+
+      // SQL fallback (or RAG disabled)
       console.log("Sending prompt to /api/sales-chat", text);
       const res = await fetch("/api/sales-chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt: text })
       });
-      console.log("/api/sales-chat response status:", res.status);
       const data = await res.json();
       console.debug("/api/sales-chat response json:", data);
       if (data.error) {
         setMessages((m) => [...m, { role: "bot", text: `Error: ${data.error}`, timestamp: new Date() }]);
       } else if (data.type === "table") {
-        setMessages((m) => [...m, { role: "bot", rows: data.rows, timestamp: new Date() }]);
+        setMessages((m) => [...m, { role: "bot", rows: data.rows, correlationId: data.correlationId, durationMs: data.durationMs, timestamp: new Date() }]);
       } else if (data.type === "chart") {
-        setMessages((m) => [...m, {
-          role: "bot",
-          chart: { labels: data.labels, values: data.values, chartType: data.chartType },
-          timestamp: new Date()
-        }]);
+        setMessages((m) => [...m, { role: "bot", chart: { labels: data.labels, values: data.values, chartType: data.chartType }, correlationId: data.correlationId, durationMs: data.durationMs, timestamp: new Date() }]);
       } else if (data.type === "help") {
-        setMessages((m) => [...m, {
-          role: "bot",
-            text: data.message + "\n\nExamples:\n" + (data.examples || []).map((ex: string) => `• ${ex}`).join("\n"),
-          timestamp: new Date()
-        }]);
+        setMessages((m) => [...m, { role: "bot", text: data.message + "\n\nExamples:\n" + (data.examples || []).map((ex: string) => `• ${ex}`).join("\n"), correlationId: data.correlationId, durationMs: data.durationMs, timestamp: new Date() }]);
       } else if (data.type === "summary") {
-        setMessages((m) => [...m, { role: "bot", text: JSON.stringify(data.summary, null, 2), timestamp: new Date() }]);
+        setMessages((m) => [...m, { role: "bot", text: JSON.stringify(data.summary, null, 2), correlationId: data.correlationId, durationMs: data.durationMs, timestamp: new Date() }]);
       } else {
-        setMessages((m) => [...m, { role: "bot", text: JSON.stringify(data), timestamp: new Date() }]);
+        setMessages((m) => [...m, { role: "bot", text: JSON.stringify(data), correlationId: data.correlationId, durationMs: data.durationMs, timestamp: new Date() }]);
       }
     } catch (e: any) {
-      console.error("Error calling /api/sales-chat:", e);
-      setMessages((m) => [...m, { role: "bot", text: `Failed to connect: ${e.message}`, timestamp: new Date() }]);
+      console.error("Error calling API:", e);
+      setMessages((m) => [...m, { role: "bot", text: `Failed to connect: ${e?.message ?? String(e)}`, timestamp: new Date() }]);
     } finally {
       setLoading(false);
       inputRef.current?.focus();
@@ -146,7 +154,7 @@ export default function SalesChatbot() {
   };
 
   return (
-    <div className="flex flex-col h-screen max-h-[900px] w-full x-auto bg-gradient-to-br from-slate-50 to-slate-100">
+    <div className="flex flex-col h-screen  w-full x-auto bg-gradient-to-br from-slate-50 to-slate-100">
       {/* Header */}
       <div className="bg-white border-b border-slate-200 px-6 py-4 shadow-sm">
         <div className="flex items-center gap-3 w-full">
@@ -164,6 +172,13 @@ export default function SalesChatbot() {
               title="Clear chat history"
             >
               Clear history
+            </button>
+            <button
+              onClick={() => setUseRag((s) => !s)}
+              className={`text-xs font-medium px-2 py-1 rounded ${useRag ? 'bg-sky-100 text-sky-700 border border-sky-200' : 'bg-white text-slate-600 border border-slate-200'}`}
+              title="Toggle RAG-first"
+            >
+              RAG: {useRag ? 'On' : 'Off'}
             </button>
           </div>
         </div>
@@ -212,13 +227,32 @@ export default function SalesChatbot() {
               )}
             
               {m.chart && (
-                <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 mt-2 w-full">
-                  <div className="flex items-center gap-2 mb-4">
-                    <BarChart3 className="w-4 h-4 text-sky-600" />
-                    <span className="text-sm font-medium text-slate-700">Sales Chart</span>
-                  </div>
-                  <LazyBarChart labels={m.chart.labels} values={m.chart.values} />
-                </div>
+                // Guard: only render chart if labels exist and at least one non-zero value
+                (() => {
+                  const labels = m.chart.labels || [];
+                  const values = m.chart.values || [];
+                  const hasData = Array.isArray(values) && values.some((v: any) => Math.abs(Number(v) || 0) > 0) && labels.length > 0;
+                  if (!hasData) {
+                    return (
+                      <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 mt-2 w-full">
+                        <div className="flex items-center gap-2 mb-4">
+                          <BarChart3 className="w-4 h-4 text-sky-600" />
+                          <span className="text-sm font-medium text-slate-700">Sales Chart</span>
+                        </div>
+                        <div className="text-sm text-slate-600">No chartable data available for the requested query. Try widening the date range or removing filters.</div>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 mt-2 w-full">
+                      <div className="flex items-center gap-2 mb-4">
+                        <BarChart3 className="w-4 h-4 text-sky-600" />
+                        <span className="text-sm font-medium text-slate-700">Sales Chart</span>
+                      </div>
+                      <LazyBarChart labels={labels} values={values} />
+                    </div>
+                  );
+                })()
               )}
 
               <span className="text-xs text-slate-400 mt-1 px-1">

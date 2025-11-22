@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { checkRpcsAvailable } from "@/lib/supabase/rpc-check";
 import { recordRequest } from "@/lib/metrics";
 
 // Query efficiency constants
@@ -21,7 +22,32 @@ const TABLE_COLUMNS = [
 const CHART_COLUMNS = ["billing_date", "Amount", "MATNR", "country", "company_code", "billing_type"];
 
 // Helper to build select string from whitelist
-const selectColumns = (cols: string[]) => cols.join(", ");
+// Quote identifiers to preserve casing and handle mixed-case columns like "Amount"
+const quoteIdentifier = (s: string) => `"${s.replace(/"/g, '""')}"`;
+const selectColumns = (cols: string[]) => cols.map(quoteIdentifier).join(", ");
+
+// Normalize rows returned from the DB into a consistent shape for the frontend and RAG.
+// Preserves original keys but adds lowercase/canonical properties where helpful.
+const normalizeRow = (r: any) => {
+  if (!r || typeof r !== "object") return r;
+  const out: any = { ...r };
+  // Amount may be stored as mixed-case "Amount" (text). Provide numeric alias `amount`.
+  if (r.Amount !== undefined) {
+    out.amount = Number(r.Amount) || 0;
+  } else if (r.amount !== undefined) {
+    out.amount = Number(r.amount) || 0;
+  }
+  // Common mixed-case columns -> lowercase aliases
+  if (r.MATNR !== undefined) out.matnr = r.MATNR;
+  if (r.Division !== undefined) out.division = r.Division;
+  if (r.Plant !== undefined) out.plant = r.Plant;
+  // Ensure billing_date is normalized to ISO date string (YYYY-MM-DD) when possible
+  if (r.billing_date) {
+    const d = new Date(r.billing_date);
+    out.billing_date = !isNaN(d.getTime()) ? d.toISOString().slice(0, 10) : r.billing_date;
+  }
+  return out;
+};
 
 // Minimal placeholder POST while we stabilize the route file
 export async function POST(request: Request) {
@@ -89,7 +115,8 @@ export async function POST(request: Request) {
       if (cust) filters.coustmer_code = cust[2];
       // NEW: billing type filter support
       // Matches: "billing type RE", "billing type: RE", "billing type = RE", "billing type is RE"
-      const billingType = text.match(/billing\s*type\s*(?:is|=|:)?\s*([A-Za-z0-9_\-]+)/i);
+  // Accept variants like "billing_type", "billing-type", "billingtype", and common minor typos
+  const billingType = text.match(/bill(?:ing|int)[\s_\-]*type\s*(?:is|=|:)?\s*([A-Za-z0-9_\-]+)/i);
       if (billingType) {
         // Adjust the column name below if your table uses a different identifier (e.g. billing_type_code)
         filters.billing_type = billingType[1];
@@ -158,8 +185,8 @@ export async function POST(request: Request) {
         return finalize({ error: error.message }, error.message);
       }
       intent = "top";
-      rowCount = (data || []).length;
-      return finalize({ type: "table", rows: data || [] });
+  rowCount = (data || []).length;
+  return finalize({ type: "table", rows: (data || []).map(normalizeRow) });
     }
 
     if (lower.includes("earliest") || lower.includes("oldest") || lower.includes("first records") || (lower.includes("earliest") && topN)) {
@@ -175,8 +202,8 @@ export async function POST(request: Request) {
         return finalize({ error: error.message }, error.message);
       }
       intent = "earliest";
-      rowCount = (data || []).length;
-      return finalize({ type: "table", rows: data || [] });
+  rowCount = (data || []).length;
+  return finalize({ type: "table", rows: (data || []).map(normalizeRow) });
     }
 
     if (lower.includes("latest") || lower.includes("recent") || lower.includes("most recent") || lower.includes("last records")) {
@@ -192,8 +219,8 @@ export async function POST(request: Request) {
         return finalize({ error: error.message }, error.message);
       }
       intent = "latest";
-      rowCount = (data || []).length;
-      return finalize({ type: "table", rows: data || [] });
+  rowCount = (data || []).length;
+  return finalize({ type: "table", rows: (data || []).map(normalizeRow) });
     }
 
     if (lower.includes("chart") || lower.match(/sum|total|average|avg|count/)) {
@@ -202,40 +229,119 @@ export async function POST(request: Request) {
       const rangeEndISO = range?.[1] ? range[1].toISOString().slice(0, 10) : null;
 
       const wantsMonthly = lower.includes("month") || lower.includes("monthly") || lower.includes("by month");
-      const wantsCountry = lower.includes("by country");
-      const wantsProduct = lower.includes("by product") || lower.includes("by matnr") || lower.includes("by material");
+        const wantsYear = lower.includes("year") || lower.includes("annual") || lower.includes("annually") || lower.includes("by year");
+        const wantsCountry = lower.includes("by country");
+        const wantsProduct = lower.includes("by product") || lower.includes("by matnr") || lower.includes("by material");
 
-      // Attempt RPC-based aggregation first for efficiency
+      // Attempt RPC-based aggregation first for efficiency.
+      // Strategy:
+      // 1) Prefer a single, generic `sales_aggregate` RPC that accepts a `granularity` param
+      //    (e.g. 'month', 'year', 'country', 'product') and returns { period, total_amount } rows.
+      // 2) If not available, fall back to legacy RPC names (monthly_sales, country_sales, product_sales, yearly_sales).
+      // 3) If RPCs are missing or return errors, fall back to local aggregation.
       const tryRpcAggregation = async () => {
+        // Probe which RPCs are available (cached) and log once.
+        try {
+          await checkRpcsAvailable(supabase);
+        } catch (e) {
+          // ignore probe errors
+        }
+        const rpcArgs = {
+          granularity: wantsYear ? 'year' : wantsMonthly ? 'month' : wantsCountry ? 'country' : wantsProduct ? 'product' : 'month',
+          start_date: rangeStartISO,
+          end_date: rangeEndISO,
+          country_filter: filters.country || null,
+          product_filter: filters.MATNR || null,
+        };
+
+        // 1) Try the generic sales_aggregate RPC first
+        try {
+          const { data, error } = await supabase.rpc("sales_aggregate", rpcArgs as any);
+          if (!error && data) return { kind: rpcArgs.granularity, data } as const;
+          // If error is a function-not-found, we'll fall through to legacy names
+          if (error) throw error;
+        } catch (err: any) {
+          // swallow and try legacy names
+          // eslint-disable-next-line no-console
+          console.debug("sales_aggregate RPC not available or failed:", err?.message || err);
+        }
+
+        // 2) Legacy RPCs (kept for compatibility). Try names based on intent.
+        const legacyAttempts: Array<() => Promise<{ kind: string; data: any } | null>> = [];
+
         if (wantsMonthly) {
-          // monthly_sales(start_date date, end_date date, country_filter text, product_filter text)
-          const { data, error } = await supabase.rpc("monthly_sales", {
-            start_date: rangeStartISO,
-            end_date: rangeEndISO,
-            country_filter: filters.country || null,
-            product_filter: filters.MATNR || null,
+          legacyAttempts.push(async () => {
+            try {
+              const { data, error } = await supabase.rpc("monthly_sales", {
+                start_date: rangeStartISO,
+                end_date: rangeEndISO,
+                country_filter: filters.country || null,
+                product_filter: filters.MATNR || null,
+              });
+              if (error) throw error;
+              return { kind: "monthly", data } as const;
+            } catch (e) {
+              return null;
+            }
           });
-          if (error) throw error;
-          return { kind: "monthly", data } as const;
+          // also try yearly name if user asked for months but db exposes yearly aggregation under a different name
+          legacyAttempts.push(async () => {
+            try {
+              const { data, error } = await supabase.rpc("sales_years", {
+                start_date: rangeStartISO,
+                end_date: rangeEndISO,
+                country_filter: filters.country || null,
+                product_filter: filters.MATNR || null,
+              });
+              if (error) throw error;
+              return { kind: "year", data } as const;
+            } catch (e) {
+              return null;
+            }
+          });
         }
+
         if (wantsCountry) {
-          const { data, error } = await supabase.rpc("country_sales", {
-            start_date: rangeStartISO,
-            end_date: rangeEndISO,
-            product_filter: filters.MATNR || null,
+          legacyAttempts.push(async () => {
+            try {
+              const { data, error } = await supabase.rpc("country_sales", {
+                start_date: rangeStartISO,
+                end_date: rangeEndISO,
+                product_filter: filters.MATNR || null,
+              });
+              if (error) throw error;
+              return { kind: "country", data } as const;
+            } catch (e) {
+              return null;
+            }
           });
-          if (error) throw error;
-          return { kind: "country", data } as const;
         }
+
         if (wantsProduct) {
-          const { data, error } = await supabase.rpc("product_sales", {
-            start_date: rangeStartISO,
-            end_date: rangeEndISO,
-            country_filter: filters.country || null,
+          legacyAttempts.push(async () => {
+            try {
+              const { data, error } = await supabase.rpc("product_sales", {
+                start_date: rangeStartISO,
+                end_date: rangeEndISO,
+                country_filter: filters.country || null,
+              });
+              if (error) throw error;
+              return { kind: "product", data } as const;
+            } catch (e) {
+              return null;
+            }
           });
-          if (error) throw error;
-          return { kind: "product", data } as const;
         }
+
+        for (const attempt of legacyAttempts) {
+          try {
+            const result = await attempt();
+            if (result) return result;
+          } catch (_) {
+            // ignore and continue
+          }
+        }
+
         return null;
       };
 
@@ -247,27 +353,35 @@ export async function POST(request: Request) {
       }
 
       if (aggregated) {
-        if (aggregated.kind === "monthly") {
-          const labels = aggregated.data.map((r: any) => r.month);
-          const values = aggregated.data.map((r: any) => Number(r.total_amount) || 0);
-          intent = "chart-monthly-rpc";
-          rowCount = aggregated.data.length;
-          return finalize({ type: "chart", chartType: "bar", labels, values, source: "rpc" });
+        // Normalize RPC result shapes so both generic `sales_aggregate` (period/total_amount)
+        // and legacy RPCs (month/total_amount, country/total_amount, matnr/total_amount) work.
+        const rows = Array.isArray(aggregated.data) ? aggregated.data : [];
+        const kind = (aggregated.kind || '').toString();
+
+        const readValue = (r: any) => Number(r?.total_amount ?? r?.totalamount ?? r?.total ?? r?.value ?? 0) || 0;
+        const readLabel = (r: any) => {
+          return (
+            r?.month ?? r?.year ?? r?.period ?? r?.country ?? r?.matnr ?? r?.product ?? r?.label ?? '(none)'
+          );
+        };
+
+        const labels = rows.map((r: any) => String(readLabel(r)));
+        const values = rows.map((r: any) => readValue(r));
+        const hasData = values.some((v: number) => Math.abs(Number(v)) > 0);
+
+        // Create a friendly kind label for telemetry (month/year/country/product)
+        let friendlyKind = kind;
+        if (kind === 'monthly' || kind === 'month') friendlyKind = 'month';
+        if (kind === 'yearly' || kind === 'year') friendlyKind = 'year';
+
+        intent = hasData ? `chart-${friendlyKind}-rpc` : `chart-${friendlyKind}-rpc-empty`;
+        rowCount = rows.length;
+
+        if (!labels.length || !hasData) {
+          return finalize({ type: 'help', message: 'No data available for the requested chart. Try adjusting filters or date range.' });
         }
-        if (aggregated.kind === "country") {
-          const labels = aggregated.data.map((r: any) => r.country);
-          const values = aggregated.data.map((r: any) => Number(r.total_amount) || 0);
-          intent = "chart-country-rpc";
-          rowCount = aggregated.data.length;
-          return finalize({ type: "chart", chartType: "bar", labels, values, source: "rpc" });
-        }
-        if (aggregated.kind === "product") {
-          const labels = aggregated.data.map((r: any) => r.matnr);
-          const values = aggregated.data.map((r: any) => Number(r.total_amount) || 0);
-          intent = "chart-product-rpc";
-          rowCount = aggregated.data.length;
-          return finalize({ type: "chart", chartType: "bar", labels, values, source: "rpc" });
-        }
+
+        return finalize({ type: 'chart', chartType: 'bar', labels, values, source: 'rpc' });
       }
 
       // Fallback: local aggregation on limited raw rows
@@ -296,8 +410,12 @@ export async function POST(request: Request) {
         });
         const labels = Array.from(map.keys()).sort();
         const values = labels.map((k) => map.get(k) || 0);
-        intent = "chart-monthly-fallback";
+        const hasData = values.some((v) => Math.abs(Number(v)) > 0);
+        intent = hasData ? "chart-monthly-fallback" : "chart-monthly-fallback-empty";
         rowCount = rows.length;
+        if (!labels.length || !hasData) {
+          return finalize({ type: "help", message: "No data available for the requested monthly chart. Try adjusting filters or date range." });
+        }
         return finalize({ type: "chart", chartType: "bar", labels, values, source: "fallback" });
       }
       if (wantsCountry) {
@@ -309,8 +427,12 @@ export async function POST(request: Request) {
         });
         const labels = Array.from(map.keys()).sort();
         const values = labels.map((k) => map.get(k) || 0);
-        intent = "chart-country-fallback";
+        const hasData = values.some((v) => Math.abs(Number(v)) > 0);
+        intent = hasData ? "chart-country-fallback" : "chart-country-fallback-empty";
         rowCount = rows.length;
+        if (!labels.length || !hasData) {
+          return finalize({ type: "help", message: "No data available for the requested country chart. Try adjusting filters or date range." });
+        }
         return finalize({ type: "chart", chartType: "bar", labels, values, source: "fallback" });
       }
       if (wantsProduct) {
@@ -322,8 +444,12 @@ export async function POST(request: Request) {
         });
         const labels = Array.from(map.keys()).sort();
         const values = labels.map((k) => map.get(k) || 0);
-        intent = "chart-product-fallback";
+        const hasData = values.some((v) => Math.abs(Number(v)) > 0);
+        intent = hasData ? "chart-product-fallback" : "chart-product-fallback-empty";
         rowCount = rows.length;
+        if (!labels.length || !hasData) {
+          return finalize({ type: "help", message: "No data available for the requested product chart. Try adjusting filters or date range." });
+        }
         return finalize({ type: "chart", chartType: "bar", labels, values, source: "fallback" });
       }
       if (lower.match(/sum|total/) || lower.match(/average|avg/) || lower.match(/count/)) {
@@ -334,9 +460,9 @@ export async function POST(request: Request) {
         rowCount = rows.length;
         return finalize({ type: "summary", summary: { total, count, average: avg } });
       }
-      intent = "chart-fallback-raw";
-      rowCount = rows.length;
-      return finalize({ type: "table", rows: rows.slice(0, 200) });
+  intent = "chart-fallback-raw";
+  rowCount = rows.length;
+  return finalize({ type: "table", rows: rows.map(normalizeRow).slice(0, 200) });
     }
 
     if (Object.keys(filters).length > 0 || amountRange.minAmount !== undefined || amountRange.maxAmount !== undefined) {
@@ -350,9 +476,9 @@ export async function POST(request: Request) {
         intent = "filtered-table-error";
         return finalize({ error: error.message }, error.message);
       }
-      intent = "filtered-table";
-      rowCount = (data || []).length;
-      return finalize({ type: "table", rows: data || [] });
+  intent = "filtered-table";
+  rowCount = (data || []).length;
+  return finalize({ type: "table", rows: (data || []).map(normalizeRow) });
     }
 
     intent = "help";
