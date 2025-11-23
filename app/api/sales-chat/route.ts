@@ -2,49 +2,175 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { checkRpcsAvailable } from "@/lib/supabase/rpc-check";
 import { recordRequest } from "@/lib/metrics";
+import { NEW_COLUMN_NAMES, getSelectString } from "@/lib/column-mapping";
+
+// AI-powered intent classifier using Gemini
+async function classifyIntent(prompt: string): Promise<{
+  intent: 'chart' | 'table' | 'aggregate' | 'top_n' | 'filter' | 'help' | 'unknown';
+  wantsChart: boolean;
+  wantsTable: boolean;
+  wantsTopN: boolean;
+  topN?: number;
+  aggregationType?: 'sum' | 'average' | 'count' | 'total';
+  timeGranularity?: 'day' | 'week' | 'month' | 'quarter' | 'year';
+  groupBy?: 'country' | 'product' | 'customer' | 'billing_type';
+}> {
+  const geminiKey = process.env.GEMINI_API_KEY;
+  
+  // Fallback to keyword-based if no API key
+  if (!geminiKey) {
+    const lower = prompt.toLowerCase();
+    return {
+      intent: lower.includes('chart') || lower.includes('graph') || lower.includes('plot') || lower.includes('visual') ? 'chart' : 
+              lower.includes('top') || lower.includes('first') || lower.includes('last') ? 'top_n' :
+              lower.includes('table') || lower.includes('show') || lower.includes('list') ? 'table' : 'unknown',
+      wantsChart: lower.includes('chart') || lower.includes('graph') || lower.includes('plot') || lower.includes('visual'),
+      wantsTable: lower.includes('table') || lower.includes('show') || lower.includes('list'),
+      wantsTopN: lower.includes('top') || lower.includes('first') || lower.includes('last'),
+    };
+  }
+
+  try {
+    const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent";
+    const res = await fetch(`${url}?key=${geminiKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{
+          role: "user",
+          parts: [{
+            text: `Analyze this sales data query and classify the user's intent. Return ONLY a JSON object with these exact fields:
+{
+  "intent": "chart" | "table" | "aggregate" | "top_n" | "filter" | "help",
+  "wantsChart": boolean,
+  "wantsTable": boolean,
+  "wantsTopN": boolean,
+  "topN": number or null,
+  "aggregationType": "sum" | "average" | "count" | "total" | null,
+  "timeGranularity": "day" | "week" | "month" | "quarter" | "year" | null,
+  "groupBy": "country" | "product" | "customer" | "billing_type" | null
+}
+
+User query: "${prompt}"
+
+Examples:
+"create a graph for sales last month" → {"intent":"chart","wantsChart":true,"wantsTable":false,"wantsTopN":false,"topN":null,"aggregationType":"sum","timeGranularity":"month","groupBy":null}
+"show me top 5 sales" → {"intent":"top_n","wantsChart":false,"wantsTable":true,"wantsTopN":true,"topN":5,"aggregationType":null,"timeGranularity":null,"groupBy":null}
+"total sales by country" → {"intent":"aggregate","wantsChart":true,"wantsTable":false,"wantsTopN":false,"topN":null,"aggregationType":"sum","timeGranularity":null,"groupBy":"country"}
+
+Respond with ONLY the JSON, no other text.`
+          }]
+        }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 200,
+        }
+      }),
+    });
+
+    if (res.ok) {
+      const json = await res.json();
+      const text = json?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      const match = text.match(/\{[\s\S]*\}/);
+      if (match) {
+        const parsed = JSON.parse(match[0]);
+        return parsed;
+      }
+    }
+  } catch (e) {
+    console.warn("Intent classification failed, using keyword fallback:", e);
+  }
+
+  // Fallback to keywords
+  const lower = prompt.toLowerCase();
+  return {
+    intent: lower.includes('chart') || lower.includes('graph') || lower.includes('plot') || lower.includes('visual') ? 'chart' : 
+            lower.includes('top') || lower.includes('first') || lower.includes('last') ? 'top_n' :
+            lower.includes('table') || lower.includes('show') || lower.includes('list') ? 'table' : 'unknown',
+    wantsChart: lower.includes('chart') || lower.includes('graph') || lower.includes('plot') || lower.includes('visual') || lower.includes('visualiz'),
+    wantsTable: lower.includes('table') || lower.includes('show') || lower.includes('list'),
+    wantsTopN: lower.includes('top') || lower.includes('first') || lower.includes('last'),
+  };
+}
 
 // Query efficiency constants
 const MAX_TOP_N = 100; // hard cap for top queries
 const TABLE_ROW_LIMIT = 500; // generic table limit when filters applied
 const CHART_FALLBACK_ROW_LIMIT = 5000; // cap raw rows for local aggregation fallback
 
-// Columns lists for different intents (adjust according to actual schema)
+// Columns lists for different intents - using NEW column names
 const TABLE_COLUMNS = [
-  "billing_date",
-  "Amount",
-  "MATNR",
-  "mat_description",
-  "country",
-  "company_code",
-  "coustmer_code",
-  "billing_type",
+  NEW_COLUMN_NAMES.invoiceDate,
+  NEW_COLUMN_NAMES.amount,
+  NEW_COLUMN_NAMES.materialCode,
+  NEW_COLUMN_NAMES.description,
+  NEW_COLUMN_NAMES.customerName,
+  NEW_COLUMN_NAMES.customerCity,
+  NEW_COLUMN_NAMES.plant,
+  NEW_COLUMN_NAMES.salesManager,
 ];
-const CHART_COLUMNS = ["billing_date", "Amount", "MATNR", "country", "company_code", "billing_type"];
+
+const CHART_COLUMNS = [
+  NEW_COLUMN_NAMES.invoiceDate,
+  NEW_COLUMN_NAMES.year,
+  NEW_COLUMN_NAMES.month,
+  NEW_COLUMN_NAMES.amount,
+  NEW_COLUMN_NAMES.materialCode,
+  NEW_COLUMN_NAMES.country,
+  NEW_COLUMN_NAMES.plant,
+  NEW_COLUMN_NAMES.billingDocType,
+];
 
 // Helper to build select string from whitelist
 // Quote identifiers to preserve casing and handle mixed-case columns like "Amount"
 const quoteIdentifier = (s: string) => `"${s.replace(/"/g, '""')}"`;
 const selectColumns = (cols: string[]) => cols.map(quoteIdentifier).join(", ");
 
+// Helper to parse number (handles both European format and regular numbers)
+const parseNumber = (value: any): number => {
+  if (typeof value === 'number') return value;
+  if (!value) return 0;
+  const str = String(value).trim();
+  // Try parsing as regular number first
+  const num = parseFloat(str);
+  if (!isNaN(num)) return num;
+  // Fallback: European format - remove thousand separators (dots/commas) and replace comma with dot
+  const normalized = str.replace(/[.,\s]/g, (match, offset, string) => {
+    // Last comma/dot is decimal separator
+    const lastDot = string.lastIndexOf('.');
+    const lastComma = string.lastIndexOf(',');
+    const decimalPos = Math.max(lastDot, lastComma);
+    if (offset === decimalPos) return '.';
+    return ''; // Remove thousand separators
+  });
+  const parsed = parseFloat(normalized);
+  return isNaN(parsed) ? 0 : parsed;
+};
+
 // Normalize rows returned from the DB into a consistent shape for the frontend and RAG.
 // Preserves original keys but adds lowercase/canonical properties where helpful.
 const normalizeRow = (r: any) => {
   if (!r || typeof r !== "object") return r;
   const out: any = { ...r };
-  // Amount may be stored as mixed-case "Amount" (text). Provide numeric alias `amount`.
-  if (r.Amount !== undefined) {
-    out.amount = Number(r.Amount) || 0;
+  // Amount may be stored as "Final Amount(INR)" with European format (e.g., "14.075,07")
+  // Provide numeric alias `amount` with proper parsing
+  const amountField = NEW_COLUMN_NAMES.amount; // "Final Amount(INR)"
+  if (r[amountField] !== undefined) {
+    out.amount = parseNumber(r[amountField]);
   } else if (r.amount !== undefined) {
-    out.amount = Number(r.amount) || 0;
+    out.amount = parseNumber(r.amount);
   }
   // Common mixed-case columns -> lowercase aliases
-  if (r.MATNR !== undefined) out.matnr = r.MATNR;
-  if (r.Division !== undefined) out.division = r.Division;
-  if (r.Plant !== undefined) out.plant = r.Plant;
-  // Ensure billing_date is normalized to ISO date string (YYYY-MM-DD) when possible
-  if (r.billing_date) {
-    const d = new Date(r.billing_date);
-    out.billing_date = !isNaN(d.getTime()) ? d.toISOString().slice(0, 10) : r.billing_date;
+  const materialCodeField = NEW_COLUMN_NAMES.materialCode; // "Material Code"
+  if (r[materialCodeField] !== undefined) out.matnr = r[materialCodeField];
+  // Map other fields for backward compatibility
+  const plantField = NEW_COLUMN_NAMES.plant;
+  if (r[plantField] !== undefined) out.plant = r[plantField];
+  // Ensure invoice date is normalized to ISO date string (YYYY-MM-DD) when possible
+  const invoiceDateField = NEW_COLUMN_NAMES.invoiceDate; // "Invoice Date"
+  if (r[invoiceDateField]) {
+    const d = new Date(r[invoiceDateField]);
+    out.billing_date = !isNaN(d.getTime()) ? d.toISOString().slice(0, 10) : r[invoiceDateField];
   }
   return out;
 };
@@ -79,6 +205,10 @@ export async function POST(request: Request) {
     const supabase = await createClient();
     const lower = prompt.toLowerCase();
 
+    // Use AI to classify intent
+    const aiIntent = await classifyIntent(prompt);
+    console.log("AI Intent Classification:", aiIntent);
+
     const extractNumber = (text: string) => {
       const m = text.match(/(top|first|last)\s+(\d+)/) || text.match(/(\d+)\s+(records|rows|sales)/);
       if (m) return parseInt(m[m.length - 1], 10);
@@ -106,22 +236,16 @@ export async function POST(request: Request) {
     const buildFilters = (text: string) => {
       const filters: Record<string, any> = {};
       const countryMatch = text.match(/country\s+(is\s+)?([a-z0-9\-]+)/i);
-      if (countryMatch) filters.country = countryMatch[2];
+      if (countryMatch) filters[NEW_COLUMN_NAMES.country] = countryMatch[2];
       const matMatch = text.match(/(?:matnr|product|item|material)\s+([\w\-]+)/i);
-      if (matMatch) filters.MATNR = matMatch[1];
-      const comp = text.match(/company\s*code\s*(is\s*)?([\w\-]+)/i);
-      if (comp) filters.company_code = comp[2];
-      const cust = text.match(/cust(?:omer)?\s*code\s*(is\s*)?([\w\-]+)/i);
-      if (cust) filters.coustmer_code = cust[2];
-      // NEW: billing type filter support
-      // Matches: "billing type RE", "billing type: RE", "billing type = RE", "billing type is RE"
-  // Accept variants like "billing_type", "billing-type", "billingtype", and common minor typos
-  const billingType = text.match(/bill(?:ing|int)[\s_\-]*type\s*(?:is|=|:)?\s*([A-Za-z0-9_\-]+)/i);
+      if (matMatch) filters[NEW_COLUMN_NAMES.materialCode] = matMatch[1];
+      const custMatch = text.match(/cust(?:omer)?\s*code\s*(is\s*)?([\w\-]+)/i);
+      if (custMatch) filters[NEW_COLUMN_NAMES.customerCode] = custMatch[2];
+      // Billing type filter support
+      const billingType = text.match(/bill(?:ing|int)[\s_\-]*type\s*(?:is|=|:)?\s*([A-Za-z0-9_\-]+)/i);
       if (billingType) {
-        // Adjust the column name below if your table uses a different identifier (e.g. billing_type_code)
-        filters.billing_type = billingType[1];
+        filters[NEW_COLUMN_NAMES.billingDocType] = billingType[1];
       }
-      // Generic pattern: "sales with billing type RE" or "sales with country US" could be supported in future
       return filters;
     };
 
@@ -169,9 +293,9 @@ export async function POST(request: Request) {
     const amountRange = extractAmountComparisons(prompt);
 
   filters = buildFilters(prompt);
-    const topN = extractNumber(prompt);
+    const topN = aiIntent.topN || extractNumber(prompt);
 
-    if (topN && lower.includes("top")) {
+    if ((topN && (aiIntent.wantsTopN || lower.includes("top")))) {
       const n = Math.max(1, Math.min(MAX_TOP_N, topN || 10));
       // Interpret "top" as highest Amount unless user specifies a different field later
       let qry: any = supabase.from("sales").select(selectColumns(TABLE_COLUMNS));
@@ -191,28 +315,28 @@ export async function POST(request: Request) {
 
     if (lower.includes("earliest") || lower.includes("oldest") || lower.includes("first records") || (lower.includes("earliest") && topN)) {
       const n = topN ? Math.max(1, Math.min(500, topN)) : 1;
-  let qry: any = supabase.from("sales").select(selectColumns(TABLE_COLUMNS));
+      let qry: any = supabase.from("sales").select(selectColumns(TABLE_COLUMNS));
       Object.entries(filters).forEach(([k, v]) => (qry = qry.eq(k, v)));
-  if (amountRange.minAmount !== undefined) qry = qry.gte("Amount", amountRange.minAmount);
-  if (amountRange.maxAmount !== undefined) qry = qry.lte("Amount", amountRange.maxAmount);
-      const { data, error } = await qry.order("billing_date", { ascending: true }).limit(n);
+      if (amountRange.minAmount !== undefined) qry = qry.gte(quoteIdentifier(NEW_COLUMN_NAMES.amount), amountRange.minAmount);
+      if (amountRange.maxAmount !== undefined) qry = qry.lte(quoteIdentifier(NEW_COLUMN_NAMES.amount), amountRange.maxAmount);
+      const { data, error } = await qry.order(quoteIdentifier(NEW_COLUMN_NAMES.invoiceDate), { ascending: true }).limit(n);
       if (error) {
         console.error("Supabase query error (earliest):", error.message || error);
         intent = "earliest";
         return finalize({ error: error.message }, error.message);
       }
       intent = "earliest";
-  rowCount = (data || []).length;
-  return finalize({ type: "table", rows: (data || []).map(normalizeRow) });
+      rowCount = (data || []).length;
+      return finalize({ type: "table", rows: (data || []).map(normalizeRow) });
     }
 
     if (lower.includes("latest") || lower.includes("recent") || lower.includes("most recent") || lower.includes("last records")) {
       const n = topN ? Math.max(1, Math.min(500, topN)) : 10;
-  let qry: any = supabase.from("sales").select(selectColumns(TABLE_COLUMNS));
+      let qry: any = supabase.from("sales").select(selectColumns(TABLE_COLUMNS));
       Object.entries(filters).forEach(([k, v]) => (qry = qry.eq(k, v)));
-  if (amountRange.minAmount !== undefined) qry = qry.gte("Amount", amountRange.minAmount);
-  if (amountRange.maxAmount !== undefined) qry = qry.lte("Amount", amountRange.maxAmount);
-      const { data, error } = await qry.order("billing_date", { ascending: false }).limit(n);
+      if (amountRange.minAmount !== undefined) qry = qry.gte(quoteIdentifier(NEW_COLUMN_NAMES.amount), amountRange.minAmount);
+      if (amountRange.maxAmount !== undefined) qry = qry.lte(quoteIdentifier(NEW_COLUMN_NAMES.amount), amountRange.maxAmount);
+      const { data, error } = await qry.order(quoteIdentifier(NEW_COLUMN_NAMES.invoiceDate), { ascending: false }).limit(n);
       if (error) {
         console.error("Supabase query error (latest):", error.message || error);
         intent = "latest";
@@ -223,15 +347,29 @@ export async function POST(request: Request) {
   return finalize({ type: "table", rows: (data || []).map(normalizeRow) });
     }
 
-    if (lower.includes("chart") || lower.match(/sum|total|average|avg|count/)) {
+    if (aiIntent.wantsChart || lower.includes("chart") || lower.includes("graph") || lower.includes("visualize") || lower.includes("plot") || lower.match(/sum|total|average|avg|count/)) {
       const range = extractDateRange(prompt);
       const rangeStartISO = range?.[0] ? range[0].toISOString().slice(0, 10) : null;
       const rangeEndISO = range?.[1] ? range[1].toISOString().slice(0, 10) : null;
 
-      const wantsMonthly = lower.includes("month") || lower.includes("monthly") || lower.includes("by month");
-        const wantsYear = lower.includes("year") || lower.includes("annual") || lower.includes("annually") || lower.includes("by year");
-        const wantsCountry = lower.includes("by country");
-        const wantsProduct = lower.includes("by product") || lower.includes("by matnr") || lower.includes("by material");
+      const wantsMonthly = lower.includes("month") || lower.includes("monthly") || lower.includes("by month") || aiIntent.timeGranularity === 'month';
+      const wantsYear = lower.includes("year") || lower.includes("annual") || lower.includes("annually") || lower.includes("by year") || aiIntent.timeGranularity === 'year';
+      const wantsCountry = lower.includes("by country") || aiIntent.groupBy === 'country';
+      const wantsProduct = lower.includes("by product") || lower.includes("by matnr") || lower.includes("by material") || aiIntent.groupBy === 'product';
+      
+      // Determine chart type from AI intent or keywords
+      let chartType: 'line' | 'bar' | 'area' | 'pie' = 'bar';
+      if (lower.includes('line') || lower.includes('trend')) {
+        chartType = 'line';
+      } else if (lower.includes('area') || lower.includes('filled')) {
+        chartType = 'area';
+      } else if (lower.includes('pie') || lower.includes('donut') || lower.includes('distribution')) {
+        chartType = 'pie';
+      } else if (wantsMonthly || wantsYear) {
+        chartType = 'line'; // Time series default to line
+      } else if (wantsCountry || wantsProduct) {
+        chartType = 'bar'; // Categorical comparisons default to bar
+      }
 
       // Attempt RPC-based aggregation first for efficiency.
       // Strategy:
@@ -250,8 +388,8 @@ export async function POST(request: Request) {
           granularity: wantsYear ? 'year' : wantsMonthly ? 'month' : wantsCountry ? 'country' : wantsProduct ? 'product' : 'month',
           start_date: rangeStartISO,
           end_date: rangeEndISO,
-          country_filter: filters.country || null,
-          product_filter: filters.MATNR || null,
+          country_filter: filters[NEW_COLUMN_NAMES.country] || null,
+          product_filter: filters[NEW_COLUMN_NAMES.materialCode] || null,
         };
 
         // 1) Try the generic sales_aggregate RPC first
@@ -275,8 +413,8 @@ export async function POST(request: Request) {
               const { data, error } = await supabase.rpc("monthly_sales", {
                 start_date: rangeStartISO,
                 end_date: rangeEndISO,
-                country_filter: filters.country || null,
-                product_filter: filters.MATNR || null,
+                country_filter: filters[NEW_COLUMN_NAMES.country] || null,
+                product_filter: filters[NEW_COLUMN_NAMES.materialCode] || null,
               });
               if (error) throw error;
               return { kind: "monthly", data } as const;
@@ -290,8 +428,8 @@ export async function POST(request: Request) {
               const { data, error } = await supabase.rpc("sales_years", {
                 start_date: rangeStartISO,
                 end_date: rangeEndISO,
-                country_filter: filters.country || null,
-                product_filter: filters.MATNR || null,
+                country_filter: filters[NEW_COLUMN_NAMES.country] || null,
+                product_filter: filters[NEW_COLUMN_NAMES.materialCode] || null,
               });
               if (error) throw error;
               return { kind: "year", data } as const;
@@ -381,17 +519,17 @@ export async function POST(request: Request) {
           return finalize({ type: 'help', message: 'No data available for the requested chart. Try adjusting filters or date range.' });
         }
 
-        return finalize({ type: 'chart', chartType: 'bar', labels, values, source: 'rpc' });
+        return finalize({ type: 'chart', chartType, labels, values, source: 'rpc' });
       }
 
       // Fallback: local aggregation on limited raw rows
       let qry: any = supabase.from("sales").select(selectColumns(CHART_COLUMNS));
       Object.entries(filters).forEach(([k, v]) => (qry = qry.eq(k, v)));
       if (rangeStartISO && rangeEndISO) {
-        qry = qry.gte("billing_date", rangeStartISO).lte("billing_date", rangeEndISO);
+        qry = qry.gte(quoteIdentifier(NEW_COLUMN_NAMES.invoiceDate), rangeStartISO).lte(quoteIdentifier(NEW_COLUMN_NAMES.invoiceDate), rangeEndISO);
       }
-      if (amountRange.minAmount !== undefined) qry = qry.gte("Amount", amountRange.minAmount);
-      if (amountRange.maxAmount !== undefined) qry = qry.lte("Amount", amountRange.maxAmount);
+      if (amountRange.minAmount !== undefined) qry = qry.gte(quoteIdentifier(NEW_COLUMN_NAMES.amount), amountRange.minAmount);
+      if (amountRange.maxAmount !== undefined) qry = qry.lte(quoteIdentifier(NEW_COLUMN_NAMES.amount), amountRange.maxAmount);
       const { data, error } = await qry.limit(CHART_FALLBACK_ROW_LIMIT);
       if (error) {
         console.error("Supabase query error (chart/aggregate fallback):", error.message || error);
@@ -401,11 +539,13 @@ export async function POST(request: Request) {
       const rows = data || [];
       if (wantsMonthly) {
         const map = new Map<string, number>();
+        const invoiceDateField = NEW_COLUMN_NAMES.invoiceDate;
+        const amountField = NEW_COLUMN_NAMES.amount;
         rows.forEach((r: any) => {
-          const dt = r.billing_date ? new Date(r.billing_date) : null;
+          const dt = r[invoiceDateField] ? new Date(r[invoiceDateField]) : null;
           if (!dt || isNaN(dt.getTime())) return;
           const key = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}`;
-          const amt = Number(r.Amount) || 0;
+          const amt = parseNumber(r[amountField]);
           map.set(key, (map.get(key) || 0) + amt);
         });
         const labels = Array.from(map.keys()).sort();
@@ -416,13 +556,15 @@ export async function POST(request: Request) {
         if (!labels.length || !hasData) {
           return finalize({ type: "help", message: "No data available for the requested monthly chart. Try adjusting filters or date range." });
         }
-        return finalize({ type: "chart", chartType: "bar", labels, values, source: "fallback" });
+        return finalize({ type: "chart", chartType, labels, values, source: "fallback" });
       }
       if (wantsCountry) {
         const map = new Map<string, number>();
+        const countryField = NEW_COLUMN_NAMES.country;
+        const amountField = NEW_COLUMN_NAMES.amount;
         rows.forEach((r: any) => {
-          const key = r.country || "(none)";
-          const amt = Number(r.Amount) || 0;
+          const key = r[countryField] || "(none)";
+          const amt = parseNumber(r[amountField]);
           map.set(key, (map.get(key) || 0) + amt);
         });
         const labels = Array.from(map.keys()).sort();
@@ -433,13 +575,15 @@ export async function POST(request: Request) {
         if (!labels.length || !hasData) {
           return finalize({ type: "help", message: "No data available for the requested country chart. Try adjusting filters or date range." });
         }
-        return finalize({ type: "chart", chartType: "bar", labels, values, source: "fallback" });
+        return finalize({ type: "chart", chartType, labels, values, source: "fallback" });
       }
       if (wantsProduct) {
         const map = new Map<string, number>();
+        const materialCodeField = NEW_COLUMN_NAMES.materialCode;
+        const amountField = NEW_COLUMN_NAMES.amount;
         rows.forEach((r: any) => {
-          const key = r.MATNR || "(none)";
-          const amt = Number(r.Amount) || 0;
+          const key = r[materialCodeField] || "(none)";
+          const amt = parseNumber(r[amountField]);
           map.set(key, (map.get(key) || 0) + amt);
         });
         const labels = Array.from(map.keys()).sort();
@@ -450,10 +594,11 @@ export async function POST(request: Request) {
         if (!labels.length || !hasData) {
           return finalize({ type: "help", message: "No data available for the requested product chart. Try adjusting filters or date range." });
         }
-        return finalize({ type: "chart", chartType: "bar", labels, values, source: "fallback" });
+        return finalize({ type: "chart", chartType, labels, values, source: "fallback" });
       }
       if (lower.match(/sum|total/) || lower.match(/average|avg/) || lower.match(/count/)) {
-        const total = rows.reduce((s: number, r: any) => s + (Number(r.Amount) || 0), 0);
+        const amountField = NEW_COLUMN_NAMES.amount;
+        const total = rows.reduce((s: number, r: any) => s + parseNumber(r[amountField]), 0);
         const count = rows.length;
         const avg = count ? total / count : 0;
         intent = "summary";
@@ -468,8 +613,8 @@ export async function POST(request: Request) {
     if (Object.keys(filters).length > 0 || amountRange.minAmount !== undefined || amountRange.maxAmount !== undefined) {
       let qry: any = supabase.from("sales").select(selectColumns(TABLE_COLUMNS));
       Object.entries(filters).forEach(([k, v]) => (qry = qry.eq(k, v)));
-      if (amountRange.minAmount !== undefined) qry = qry.gte("Amount", amountRange.minAmount);
-      if (amountRange.maxAmount !== undefined) qry = qry.lte("Amount", amountRange.maxAmount);
+      if (amountRange.minAmount !== undefined) qry = qry.gte(quoteIdentifier(NEW_COLUMN_NAMES.amount), amountRange.minAmount);
+      if (amountRange.maxAmount !== undefined) qry = qry.lte(quoteIdentifier(NEW_COLUMN_NAMES.amount), amountRange.maxAmount);
       const { data, error } = await qry.limit(TABLE_ROW_LIMIT);
       if (error) {
         console.error("Supabase query error (filters):", error.message || error);

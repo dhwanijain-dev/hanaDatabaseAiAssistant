@@ -1,26 +1,17 @@
 import { createClient } from "@/lib/supabase/server";
 import { embedText, embedTextBatch } from "./embeddings";
+import { NEW_COLUMN_NAMES } from "./column-mapping";
 
 /**
  * Production vector helper with:
  * - Batch ingestion with progress tracking
- * - Idempotent upserts by bill_no
+ * - Idempotent upserts by invoice number
  * - Hybrid search (vector + metadata filters)
  * - Incremental ingestion support
  */
 
 export interface SalesRow {
-  bill_no: number;
-  billing_date?: string;
-  Amount?: string;
-  MATNR?: string;
-  mat_description?: string;
-  country?: string;
-  company_code?: string;
-  coustmer_code?: string;
-  billing_type?: string;
-  Division?: string;
-  Plant?: string;
+  [key: string]: any; // Support dynamic column names
 }
 
 export interface EmbeddingRecord {
@@ -44,17 +35,27 @@ export interface SearchFilters {
 export function buildTextForEmbedding(row: SalesRow): string {
   const parts: string[] = [];
   
-  parts.push(`Bill Number: ${row.bill_no}`);
-  if (row.billing_date) parts.push(`Date: ${row.billing_date}`);
-  if (row.Amount) parts.push(`Amount: ${row.Amount}`);
-  if (row.MATNR) parts.push(`Product Code: ${row.MATNR}`);
-  if (row.mat_description) parts.push(`Product: ${row.mat_description}`);
-  if (row.country) parts.push(`Country: ${row.country}`);
-  if (row.billing_type) parts.push(`Billing Type: ${row.billing_type}`);
-  if (row.company_code) parts.push(`Company: ${row.company_code}`);
-  if (row.coustmer_code) parts.push(`Customer: ${row.coustmer_code}`);
-  if (row.Division) parts.push(`Division: ${row.Division}`);
-  if (row.Plant) parts.push(`Plant: ${row.Plant}`);
+  const invoiceNo = row[NEW_COLUMN_NAMES.invoiceNumber];
+  const invoiceDate = row[NEW_COLUMN_NAMES.invoiceDate];
+  const amount = row[NEW_COLUMN_NAMES.amount];
+  const materialCode = row[NEW_COLUMN_NAMES.materialCode];
+  const description = row[NEW_COLUMN_NAMES.description];
+  const country = row[NEW_COLUMN_NAMES.country];
+  const billingDocType = row[NEW_COLUMN_NAMES.billingDocType];
+  const customerCode = row[NEW_COLUMN_NAMES.customerCode];
+  const customerName = row[NEW_COLUMN_NAMES.customerName];
+  const plant = row[NEW_COLUMN_NAMES.plant];
+  
+  if (invoiceNo) parts.push(`Invoice Number: ${invoiceNo}`);
+  if (invoiceDate) parts.push(`Date: ${invoiceDate}`);
+  if (amount) parts.push(`Amount: ${amount}`);
+  if (materialCode) parts.push(`Product Code: ${materialCode}`);
+  if (description) parts.push(`Product: ${description}`);
+  if (country) parts.push(`Country: ${country}`);
+  if (billingDocType) parts.push(`Billing Type: ${billingDocType}`);
+  if (customerCode) parts.push(`Customer Code: ${customerCode}`);
+  if (customerName) parts.push(`Customer: ${customerName}`);
+  if (plant) parts.push(`Plant: ${plant}`);
   
   return parts.join(" | ");
 }
@@ -62,17 +63,16 @@ export function buildTextForEmbedding(row: SalesRow): string {
 // Extract searchable metadata from a sales row
 export function extractMetadata(row: SalesRow): Record<string, any> {
   return {
-    bill_no: row.bill_no,
-    billing_date: row.billing_date || null,
-    amount: row.Amount ? parseFloat(row.Amount) : null,
-    matnr: row.MATNR || null,
-    mat_description: row.mat_description || null,
-    country: row.country || null,
-    company_code: row.company_code || null,
-    coustmer_code: row.coustmer_code || null,
-    billing_type: row.billing_type || null,
-    division: row.Division || null,
-    plant: row.Plant || null,
+    invoice_no: row[NEW_COLUMN_NAMES.invoiceNumber] || null,
+    invoice_date: row[NEW_COLUMN_NAMES.invoiceDate] || null,
+    amount: row[NEW_COLUMN_NAMES.amount] ? parseFloat(String(row[NEW_COLUMN_NAMES.amount]).replace(/\./g, '').replace(',', '.')) : null,
+    material_code: row[NEW_COLUMN_NAMES.materialCode] || null,
+    description: row[NEW_COLUMN_NAMES.description] || null,
+    country: row[NEW_COLUMN_NAMES.country] || null,
+    customer_code: row[NEW_COLUMN_NAMES.customerCode] || null,
+    customer_name: row[NEW_COLUMN_NAMES.customerName] || null,
+    billing_doc_type: row[NEW_COLUMN_NAMES.billingDocType] || null,
+    plant: row[NEW_COLUMN_NAMES.plant] || null,
   };
 }
 
@@ -80,16 +80,15 @@ export function extractMetadata(row: SalesRow): Record<string, any> {
 function buildTextFromMetadata(metadata: Record<string, any>): string {
   const parts: string[] = [];
   
-  if (metadata.bill_no) parts.push(`Bill Number: ${metadata.bill_no}`);
-  if (metadata.billing_date) parts.push(`Date: ${metadata.billing_date}`);
+  if (metadata.invoice_no) parts.push(`Invoice Number: ${metadata.invoice_no}`);
+  if (metadata.invoice_date) parts.push(`Date: ${metadata.invoice_date}`);
   if (metadata.amount) parts.push(`Amount: ${metadata.amount}`);
-  if (metadata.matnr) parts.push(`Product Code: ${metadata.matnr}`);
-  if (metadata.mat_description) parts.push(`Product: ${metadata.mat_description}`);
+  if (metadata.material_code) parts.push(`Product Code: ${metadata.material_code}`);
+  if (metadata.description) parts.push(`Product: ${metadata.description}`);
   if (metadata.country) parts.push(`Country: ${metadata.country}`);
-  if (metadata.billing_type) parts.push(`Billing Type: ${metadata.billing_type}`);
-  if (metadata.company_code) parts.push(`Company: ${metadata.company_code}`);
-  if (metadata.coustmer_code) parts.push(`Customer: ${metadata.coustmer_code}`);
-  if (metadata.division) parts.push(`Division: ${metadata.division}`);
+  if (metadata.billing_doc_type) parts.push(`Billing Type: ${metadata.billing_doc_type}`);
+  if (metadata.customer_code) parts.push(`Customer Code: ${metadata.customer_code}`);
+  if (metadata.customer_name) parts.push(`Customer: ${metadata.customer_name}`);
   if (metadata.plant) parts.push(`Plant: ${metadata.plant}`);
   
   return parts.join(" | ");
@@ -119,23 +118,42 @@ export async function ingestSalesRowsToVectors(
   // eslint-disable-next-line no-console
   console.log(`Starting ingestion of ${total} sales rows in batches of ${batchSize}...`);
   
+  // Helper to quote column names with spaces/special chars
+  const quoteCol = (name: string) => `"${name.replace(/"/g, '""')}"`;
+  
+  // Build select string for the columns we need
+  const selectCols = [
+    quoteCol(NEW_COLUMN_NAMES.invoiceNumber),
+    quoteCol(NEW_COLUMN_NAMES.invoiceDate),
+    quoteCol(NEW_COLUMN_NAMES.amount),
+    quoteCol(NEW_COLUMN_NAMES.materialCode),
+    quoteCol(NEW_COLUMN_NAMES.description),
+    quoteCol(NEW_COLUMN_NAMES.country),
+    quoteCol(NEW_COLUMN_NAMES.customerCode),
+    quoteCol(NEW_COLUMN_NAMES.customerName),
+    quoteCol(NEW_COLUMN_NAMES.billingDocType),
+    quoteCol(NEW_COLUMN_NAMES.plant),
+  ].join(', ');
+  
   while (processed < total) {
     const currentBatchSize = Math.min(batchSize, total - processed);
     
     // Fetch batch
     const { data: rows, error } = await supabase
       .from("sales")
-      .select("bill_no, billing_date, Amount, MATNR, mat_description, country, company_code, coustmer_code, billing_type, Division, Plant")
+      .select(selectCols)
       .range(processed, processed + currentBatchSize - 1)
-      .order("bill_no");
+      .order(quoteCol(NEW_COLUMN_NAMES.invoiceNumber));
     
     if (error) throw error;
     if (!rows || rows.length === 0) break;
     
-    // Deduplicate rows by bill_no (keep last occurrence)
+    // Deduplicate rows by invoice number (keep last occurrence)
     const uniqueRowsMap = new Map();
-    rows.forEach(row => {
-      uniqueRowsMap.set(String(row.bill_no), row);
+    const invoiceNumberCol = NEW_COLUMN_NAMES.invoiceNumber;
+    rows.forEach((row: any) => {
+      const invoiceNo = row[invoiceNumberCol];
+      uniqueRowsMap.set(String(invoiceNo), row);
     });
     const uniqueRows = Array.from(uniqueRowsMap.values());
     
@@ -146,8 +164,8 @@ export async function ingestSalesRowsToVectors(
     const embeddings = await embedTextBatch(texts, 50); // Sub-batch for API limits
     
     // Prepare records for upsert (without text_content for compatibility)
-    const records = uniqueRows.map((row, idx) => ({
-      id: String(row.bill_no),
+    const records = uniqueRows.map((row: any, idx) => ({
+      id: String(row[invoiceNumberCol]),
       embedding: embeddings[idx],
       metadata: extractMetadata(row),
     }));
@@ -182,53 +200,71 @@ export async function ingestSalesRowsToVectors(
 export async function ingestNewSalesRows(batchSize = 100, onProgress?: (processed: number) => void) {
   const supabase = await createClient();
   
-  // Find bill_nos that don't have embeddings yet
+  // Helper to quote column names
+  const quoteCol = (name: string) => `"${name.replace(/"/g, '""')}"`;
+  const invoiceNumberCol = NEW_COLUMN_NAMES.invoiceNumber;
+  
+  // Find invoice numbers that don't have embeddings yet
   const { data: allSales } = await supabase
     .from("sales")
-    .select("bill_no");
+    .select(quoteCol(invoiceNumberCol));
   
   const { data: existingEmbeddings } = await supabase
     .from("sales_embeddings")
     .select("id");
   
   const existingIds = new Set((existingEmbeddings || []).map((e: any) => e.id));
-  const missingBillNos = (allSales || [])
-    .map((s: any) => String(s.bill_no))
+  const missingInvoiceNos = (allSales || [])
+    .map((s: any) => String(s[invoiceNumberCol]))
     .filter((id) => !existingIds.has(id));
   
   // eslint-disable-next-line no-console
-  console.log(`Found ${missingBillNos.length} sales rows without embeddings`);
+  console.log(`Found ${missingInvoiceNos.length} sales rows without embeddings`);
   
-  if (missingBillNos.length === 0) {
+  if (missingInvoiceNos.length === 0) {
     return { processed: 0, total: 0 };
   }
   
   let processed = 0;
   
-  for (let i = 0; i < missingBillNos.length; i += batchSize) {
-    const batchIds = missingBillNos.slice(i, i + batchSize);
+  // Build select string for the columns we need
+  const selectCols = [
+    quoteCol(NEW_COLUMN_NAMES.invoiceNumber),
+    quoteCol(NEW_COLUMN_NAMES.invoiceDate),
+    quoteCol(NEW_COLUMN_NAMES.amount),
+    quoteCol(NEW_COLUMN_NAMES.materialCode),
+    quoteCol(NEW_COLUMN_NAMES.description),
+    quoteCol(NEW_COLUMN_NAMES.country),
+    quoteCol(NEW_COLUMN_NAMES.customerCode),
+    quoteCol(NEW_COLUMN_NAMES.customerName),
+    quoteCol(NEW_COLUMN_NAMES.billingDocType),
+    quoteCol(NEW_COLUMN_NAMES.plant),
+  ].join(', ');
+  
+  for (let i = 0; i < missingInvoiceNos.length; i += batchSize) {
+    const batchIds = missingInvoiceNos.slice(i, i + batchSize);
     
     // Fetch rows
     const { data: rows, error } = await supabase
       .from("sales")
-      .select("bill_no, billing_date, Amount, MATNR, mat_description, country, company_code, coustmer_code, billing_type, Division, Plant")
-      .in("bill_no", batchIds.map((id) => parseInt(id, 10)));
+      .select(selectCols)
+      .in(quoteCol(invoiceNumberCol), batchIds);
     
     if (error) throw error;
     if (!rows || rows.length === 0) continue;
     
-    // Deduplicate rows by bill_no (keep last occurrence)
+    // Deduplicate rows by invoice number (keep last occurrence)
     const uniqueRowsMap = new Map();
-    rows.forEach(row => {
-      uniqueRowsMap.set(String(row.bill_no), row);
+    rows.forEach((row: any) => {
+      uniqueRowsMap.set(String(row[invoiceNumberCol]), row);
     });
     const uniqueRows = Array.from(uniqueRowsMap.values());
     
     const texts = uniqueRows.map(buildTextForEmbedding);
     const embeddings = await embedTextBatch(texts, 50);
     
-    const records = uniqueRows.map((row, idx) => ({
-      id: String(row.bill_no),
+    const records = uniqueRows.map((row: any, idx) => ({
+      id: String(row[invoiceNumberCol]),
       embedding: embeddings[idx],
       metadata: extractMetadata(row),
     }));
@@ -246,7 +282,7 @@ export async function ingestNewSalesRows(batchSize = 100, onProgress?: (processe
     }
   }
   
-  return { processed, total: missingBillNos.length };
+  return { processed, total: missingInvoiceNos.length };
 }
 
 /**
